@@ -363,19 +363,6 @@ class ObjectHitMaskTask(Task):
                 output, target, object_valid_mask=object_pad, input_pad_mask=hit_pad, sample_weight=sample_weight
             )
         return losses
-    
-    def loss_per_element(self, outputs: dict[str, Tensor], targets: dict[str, Tensor]) -> dict[str, Tensor]:
-        output = outputs[self.output_object_hit + "_logit"]
-        target = targets[self.target_object_hit + "_" + self.target_field].type_as(output)
-        hit_pad = targets[self.input_hit + "_valid"]
-        object_pad = targets[self.target_object + "_valid"]
-        sample_weight = target + self.null_weight * (1 - target)
-        losses = {}
-        for loss_fn, loss_weight in self.losses.items():
-            losses[loss_fn] = loss_weight * loss_fns[loss_fn](
-                output, target, object_valid_mask=object_pad, input_pad_mask=hit_pad, sample_weight=sample_weight, reduction="none"
-            )
-        return losses
 
 
 class RegressionTask(Task):
@@ -1010,14 +997,6 @@ class ObjectClassificationTask(Task):
 
         return outputs[self.output_object + "_class_prob"].detach().argmax(-1) < self.num_classes  # Valid if class is less than num_classes
 
-    def loss_per_element(self, outputs: dict[str, Tensor], targets: dict[str, Tensor]) -> dict[str, Tensor]:
-        output = outputs[self.output_object + "_class_prob"]
-        target = targets[self.target_object + "_class"].long()
-        losses = {}
-        for loss_fn, loss_weight in self.losses.items():
-            losses[loss_fn] = loss_weight * loss_fns[loss_fn](output, target, mask=None, weight=self.class_weights, reduction="none")
-        return losses
-
 
 class IncidenceRegressionTask(Task):
     def __init__(
@@ -1084,17 +1063,6 @@ class IncidenceRegressionTask(Task):
 
         return losses
 
-    def loss_per_element(self, outputs: dict[str, Tensor], targets: dict[str, Tensor]) -> dict[str, Tensor]:
-        output = outputs[self.output_object + "_incidence"]
-        target = targets[self.target_object + "_incidence"].type_as(output)
-        node_mask = targets[self.input_hit + "_valid"].unsqueeze(1).expand_as(output)
-        object_mask = targets[self.target_object + "_valid"].unsqueeze(-1).expand_as(output)
-        mask = node_mask & object_mask
-        losses = {}
-        for loss_fn, loss_weight in self.losses.items():
-            losses[loss_fn] = loss_weight * loss_fns[loss_fn](output, target, mask=mask, reduction="none")
-        return losses
-
 
 class IncidenceBasedRegressionTask(RegressionTask):
     def __init__(
@@ -1140,8 +1108,7 @@ class IncidenceBasedRegressionTask(RegressionTask):
         self.net = net
         self.use_nodes = use_nodes
         self.inputs = [input_object + "_embed"] + [input_hit + "_" + field for field in fields]
-        self.outputs = [output_object + "_regr", output_object + "_proxy_regr", 
-            output_object + "_proxy_ch_regr", output_object + "_proxy_neut_regr", output_object + "_is_charged"]
+        self.outputs = [output_object + "_regr", output_object + "_proxy_regr"]
         self.mode = mode
         if mode not in {"offset", "scale"}:
             raise ValueError(f"Invalid mode {mode}, must be 'offset' or 'scale'")
@@ -1156,8 +1123,7 @@ class IncidenceBasedRegressionTask(RegressionTask):
         # get the predictions
         if self.use_incidence:
             inc = x["incidence"].detach()
-            proxy_feats, is_charged, (proxy_feats_charged, proxy_feats_neutral) = \
-                self.get_proxy_feats(inc, x, class_probs=x["class_probs"].detach())
+            proxy_feats, is_charged = self.get_proxy_feats(inc, x, class_probs=x["class_probs"].detach())
             input_data = torch.cat(
                 [
                     x[self.input_object + "_embed"],
@@ -1180,24 +1146,14 @@ class IncidenceBasedRegressionTask(RegressionTask):
             preds = self.net(input_data) * proxy_feats
         else:
             raise ValueError(f"Invalid mode {self.mode}")
-
-        return {self.output_object + "_regr": preds, self.output_object + "_proxy_regr": proxy_feats,
-            self.output_object + "_proxy_ch_regr": proxy_feats_charged, 
-            self.output_object + "_proxy_neut_regr": proxy_feats_neutral,
-            self.output_object + "_is_charged": is_charged
-        }
+        return {self.output_object + "_regr": preds, self.output_object + "_proxy_regr": proxy_feats}
 
     def predict(self, outputs: dict[str, Tensor]) -> dict[str, Tensor]:
         # Split the regression vector into the separate fields
         pflow_regr = outputs[self.output_object + "_regr"]
         proxy_regr = outputs[self.output_object + "_proxy_regr"]
-        proxy_ch_regr = outputs[self.output_object + "_proxy_ch_regr"]
-        proxy_neut_regr = outputs[self.output_object + "_proxy_neut_regr"]
         return {self.output_object + "_" + field: pflow_regr[..., i] for i, field in enumerate(self.fields)} | {
-            self.output_object + "_proxy_" + field: proxy_regr[..., i] for i, field in enumerate(self.fields)} | {
-            self.output_object + "_proxy_ch_" + field: proxy_ch_regr[..., i] for i, field in enumerate(self.fields)} | {
-            self.output_object + "_proxy_neut_" + field: proxy_neut_regr[..., i] for i, field in enumerate(self.fields)} | {
-            self.output_object + "_is_charged": outputs[self.output_object + "_is_charged"]
+            self.output_object + "_proxy_" + field: proxy_regr[..., i] for i, field in enumerate(self.fields)
         }
 
     def metrics(self, preds: dict[str, Tensor], targets: dict[str, Tensor]) -> dict[str, Tensor]:
@@ -1286,31 +1242,11 @@ class IncidenceBasedRegressionTask(RegressionTask):
         charged_inc_top2 = (topk_attn(charged_inc, 2, dim=-2) & (charged_inc > 0)).float()
         charged_inc_max = charged_inc.max(-2, keepdim=True)[0]
         charged_inc_new = (charged_inc == charged_inc_max) & (charged_inc > 0)
-        # ------------------------
-        particle_max_idx = charged_inc.argmax(dim=-1, keepdim=True)
-        # Create a mask that is True only at that specific index
-        is_first_max_particle = torch.zeros_like(charged_inc, dtype=torch.bool).scatter_(-1, particle_max_idx, True)
-        # Apply the filter
-        charged_inc_new = charged_inc_new & is_first_max_particle
-        # ---------------------
         # TODO: check this
         # charged_inc_new = charged_inc.float()
         zero_track_mask = charged_inc_new.sum(-1, keepdim=True) == 0
         charged_inc = torch.where(zero_track_mask, charged_inc_top2, charged_inc_new)
- 
-        # -------------------------
-        # --- ADDED: Final Cleanup (Fixes the Top2/Recovery duplicates) ---
-        # 1. Look at the incidence scores ONLY for the tracks we have currently selected
-        current_scores = incidence * charged_inc
-        # 2. Find the single best track among the selected ones
-        final_best_idx = current_scores.argmax(dim=-1, keepdim=True)
-        # 3. Create a strict mask for that one track
-        final_strict_mask = torch.zeros_like(charged_inc, dtype=torch.bool).scatter_(-1, final_best_idx, True)
-        # 4. Apply the mask.
-        # Note: If charged_inc was all zeros, intersection with final_strict_mask remains zeros.
-        charged_inc = charged_inc * final_strict_mask.float()
- 
-        #-----------------
+
         # Split charged and neutral
         is_charged = class_probs.argmax(-1) < 3
 
@@ -1326,43 +1262,7 @@ class IncidenceBasedRegressionTask(RegressionTask):
         proxy_feats_neutral[..., 0] = inc_e_weighted.sum(-1)
         proxy_feats_neutral[..., 1] = proxy_feats_neutral[..., 0] / torch.cosh(proxy_feats_neutral[..., 2])
 
-        ### OLD
-        # proxy_feats_neutral = self.scale_proxy_feats(proxy_feats_neutral) * (~is_charged).unsqueeze(-1)
-        # proxy_feats = proxy_feats_charged + proxy_feats_neutral
-        ### NEW
-        proxy_feats_neutral = self.scale_proxy_feats(proxy_feats_neutral)
-        proxy_feats = proxy_feats_charged + proxy_feats_neutral * (~is_charged).unsqueeze(-1)
+        proxy_feats_neutral = self.scale_proxy_feats(proxy_feats_neutral) * (~is_charged).unsqueeze(-1)
+        proxy_feats = proxy_feats_charged + proxy_feats_neutral
 
-        return proxy_feats, is_charged, (proxy_feats_charged, proxy_feats_neutral)
-
-
-        # #-----------------
-        # # Split charged and neutral
-        # is_charged = class_probs.argmax(-1) < 3
-
-        # proxy_feats_charged = torch.bmm(charged_inc, proxy_feats)
-        # proxy_feats_charged[..., 0] = proxy_feats_charged[..., 1] * torch.cosh(proxy_feats_charged[..., 2])
-        # proxy_feats_charged = self.scale_proxy_feats(proxy_feats_charged) * is_charged.unsqueeze(-1)
-
-        # inc_e_weighted = incidence * proxy_feats[..., 0].unsqueeze(1)
-        # inc_e_weighted *= 1 - inputs[self.input_hit + "_is_track"].unsqueeze(1)
-        # inc = inc_e_weighted / (inc_e_weighted.sum(dim=-1, keepdim=True) + 1e-6)
-
-        # proxy_feats_neutral = torch.einsum("bnf,bpn->bpf", proxy_feats, inc)
-        # proxy_feats_neutral[..., 0] = inc_e_weighted.sum(-1)
-        # proxy_feats_neutral[..., 1] = proxy_feats_neutral[..., 0] / torch.cosh(proxy_feats_neutral[..., 2])
-
-        # proxy_feats_neutral = self.scale_proxy_feats(proxy_feats_neutral) * (~is_charged).unsqueeze(-1)
-        # proxy_feats = proxy_feats_charged + proxy_feats_neutral
-
-        # return proxy_feats, is_charged
-
-    def loss_per_element(self, outputs: dict[str, Tensor], targets: dict[str, Tensor]) -> dict[str, Tensor]:
-        target = torch.stack([targets[self.target_object + "_" + field] for field in self.fields], dim=-1)
-        output = outputs[self.output_object + "_regr"]
-        mask = targets[self.target_object + "_valid"]
-        # Per-element loss, no reduction — shape (batch, num_objects, num_fields) or (batch, num_objects) after mean over fields
-        loss = self.loss_fn(output, target, reduction="none")  # (B, N, k)
-        loss = loss.mean(dim=-1)  # (B, N) — average over fields, keep per-object
-        loss[~mask] = 0.0
-        return {self.loss_fn_name: self.loss_weight * loss}
+        return proxy_feats, is_charged

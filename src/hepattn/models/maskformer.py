@@ -243,3 +243,55 @@ class MaskFormer(nn.Module):
                 losses[layer_name][task.name] = task.loss(outputs[layer_name][task.name], targets)
 
         return losses
+
+
+    def loss_per_element(self, outputs: dict, targets: dict) -> dict:
+        """Same as loss(), but returns per-element (per-object) losses before
+        any reduction (mean/sum) is applied. Assumes each task exposes a
+        `loss_per_element` method with the same signature as `loss` but
+        without reducing over the object dimension.
+
+        Returns
+        -------
+        dict
+            Nested dict with structure losses[layer_name][task_name][loss_name] -> Tensor
+            where each tensor has shape (batch, num_objects, ...) instead of a scalar.
+        """
+        # --- cost + matching is identical to self.loss() ---
+        costs = {}
+        batch_idxs = torch.arange(targets[f"{self.target_object}_valid"].shape[0]).unsqueeze(1)
+        for layer_name, layer_outputs in outputs.items():
+            layer_costs = None
+            for task in self.tasks:
+                if layer_name != "final" and not task.has_intermediate_loss:
+                    continue
+                task_costs = task.cost(layer_outputs[task.name], targets)
+                for cost in task_costs.values():
+                    layer_costs = cost if layer_costs is None else layer_costs + cost
+            if layer_costs is not None:
+                layer_costs = layer_costs.detach()
+            costs[layer_name] = layer_costs
+
+        # Permute outputs to match the Hungarian matching
+        for layer_name, cost in costs.items():
+            if cost is None:
+                continue
+            pred_idxs = self.matcher(cost, targets[f"{self.target_object}_valid"])
+            for task in self.tasks:
+                if not task.permute_loss:
+                    continue
+                if layer_name != "final" and not task.has_intermediate_loss:
+                    continue
+                for output_name in task.outputs:
+                    outputs[layer_name][task.name][output_name] = outputs[layer_name][task.name][output_name][batch_idxs, pred_idxs]
+
+        # --- only this part differs: call loss_per_element instead of loss ---
+        losses = {}
+        for layer_name in outputs:
+            losses[layer_name] = {}
+            for task in self.tasks:
+                if layer_name != "final" and not task.has_intermediate_loss:
+                    continue
+                losses[layer_name][task.name] = task.loss_per_element(outputs[layer_name][task.name], targets)
+
+        return losses

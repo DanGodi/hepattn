@@ -33,8 +33,11 @@ def object_bce_cost(pred_logits, targets):
     return -probs * targets - (1 - probs) * (1 - targets)
 
 
-def object_ce_loss(pred_probs, true, mask=None, weight=None):  # noqa: ARG001
-    losses = F.cross_entropy(pred_probs.flatten(0, 1), true.flatten(0, 1), weight=weight)
+def object_ce_loss(pred_probs, true, mask=None, weight=None, reduction="mean"):  # noqa: ARG001
+    losses = F.cross_entropy(pred_probs.flatten(0, 1), true.flatten(0, 1), weight=weight, reduction=reduction)
+    if reduction == "none":
+        losses = losses.view(pred_probs.shape[0], pred_probs.shape[1])  # unflatten back to (B, N)
+        return losses
     return losses.mean()
 
 
@@ -60,7 +63,7 @@ def object_ce_cost(pred_logits, targets):
     return -torch.gather(probs, dim=2, index=index)
 
 
-def mask_dice_loss(pred_logits, targets, object_valid_mask=None, input_pad_mask=None, sample_weight=None):  # noqa: ARG001
+def mask_dice_loss(pred_logits, targets, object_valid_mask=None, input_pad_mask=None, sample_weight=None, reduction="mean"):  # noqa: ARG001
     """Compute the DICE loss for binary masks.
 
     Args:
@@ -85,6 +88,8 @@ def mask_dice_loss(pred_logits, targets, object_valid_mask=None, input_pad_mask=
     numerator = 2 * (probs * targets).sum(-1)
     denominator = probs.sum(-1) + targets.sum(-1)
     loss = 1 - (numerator + 1) / (denominator + 1)
+    if reduction == "none":
+        return loss
     return loss.mean()
 
 
@@ -128,7 +133,7 @@ def mask_iou_cost(pred_logits, targets, input_pad_mask=None, eps=1e-6):
         return 1 - (intersection + eps) / (eps + num_pred + num_targets - intersection)
 
 
-def mask_focal_loss(pred_logits, targets, gamma=2.0, object_valid_mask=None, input_pad_mask=None, sample_weight=None):
+def mask_focal_loss(pred_logits, targets, gamma=2.0, object_valid_mask=None, input_pad_mask=None, sample_weight=None, reduction="mean"):
     """Compute the focal loss for binary classification.
 
     Args:
@@ -162,8 +167,14 @@ def mask_focal_loss(pred_logits, targets, gamma=2.0, object_valid_mask=None, inp
     if input_pad_mask is not None:
         valid_counts = input_pad_mask.sum(-1, keepdim=True)
         loss = loss.sum(-1) / valid_counts
+        if reduction == "none":
+            return loss
         return loss.mean()
-    return loss.mean(-1).mean()
+    
+    loss = loss.mean(-1)  # reduce over hits -> per-object
+    if reduction == "none":
+        return loss
+    return loss.mean()
 
 
 def mask_focal_cost(pred_logits, targets, gamma=2.0, input_pad_mask=None, sample_weight=None):
@@ -194,7 +205,7 @@ def mask_focal_cost(pred_logits, targets, gamma=2.0, input_pad_mask=None, sample
         return torch.einsum("bnc,bmc->bnm", focal_pos, targets) + torch.einsum("bnc,bmc->bnm", focal_neg, (1 - targets))
 
 
-def mask_bce_loss(pred_logits, targets, object_valid_mask=None, input_pad_mask=None, sample_weight=None):
+def mask_bce_loss(pred_logits, targets, object_valid_mask=None, input_pad_mask=None, sample_weight=None, reduction="mean"):
     """Compute the binary cross-entropy loss for binary masks.
 
     Args:
@@ -222,8 +233,14 @@ def mask_bce_loss(pred_logits, targets, object_valid_mask=None, input_pad_mask=N
     if input_pad_mask is not None:
         valid_counts = input_pad_mask.sum(-1, keepdim=True)
         loss = loss.sum(-1) / valid_counts
+        if reduction == "none":
+            return loss
         return loss.mean()
-    return loss.mean(-1).mean()
+    
+    loss = loss.mean(-1)  # reduce over hits -> per-object
+    if reduction == "none":
+        return loss
+    return loss.mean()
 
 
 def mask_bce_cost(pred_logits, targets, input_pad_mask=None, sample_weight=None):
@@ -253,12 +270,14 @@ def mask_bce_cost(pred_logits, targets, input_pad_mask=None, sample_weight=None)
         return torch.einsum("bnc,bmc->bnm", pos, targets) + torch.einsum("bnc,bmc->bnm", neg, (1 - targets))
 
 
-def kl_div_loss(pred_logits, true, mask=None, weight=None, eps=1e-8):  # noqa: ARG001
+def kl_div_loss(pred_logits, true, mask=None, weight=None, eps=1e-8, reduction="mean"):  # noqa: ARG001
     loss = -true * torch.log(pred_logits + eps)
     # if weight is not None:
     #     loss *= weight
     if mask is not None:
         loss = loss[mask]
+    if reduction == "none":
+        return loss
     return loss.mean()
 
 
@@ -268,7 +287,7 @@ def kl_div_cost(pred_logits, true, eps=1e-8):
     return (-true[:, None, :] * torch.log(pred_logits[:, :, None] + eps)).mean(-1)
 
 
-def mask_kl_div_loss(pred_logits, targets, object_valid_mask=None, input_pad_mask=None, sample_weight=None, eps=1e-8):  # noqa: ARG001
+def mask_kl_div_loss(pred_logits, targets, object_valid_mask=None, input_pad_mask=None, sample_weight=None, eps=1e-8, reduction="mean"):  # noqa: ARG001
     """KL divergence loss for hit-object assignment (recommend using energy_fractions as input).
 
     Args:
@@ -299,8 +318,14 @@ def mask_kl_div_loss(pred_logits, targets, object_valid_mask=None, input_pad_mas
     if input_pad_mask is not None:
         valid_counts = input_pad_mask.sum(-1, keepdim=True)
         loss = loss.sum(-1) / (valid_counts + eps)
+        if reduction == "none":
+            return loss
         return loss.mean()
-    return loss.mean(-1).mean()
+    
+    loss = loss.mean(-1)  # reduce over hits -> per-object
+    if reduction == "none":
+        return loss
+    return loss.mean()
 
 
 def mask_kl_div_cost(pred_logits, targets, input_pad_mask=None, sample_weight=None, eps=1e-8):  # noqa: ARG001

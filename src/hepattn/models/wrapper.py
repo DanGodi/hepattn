@@ -5,8 +5,8 @@ from lightning import LightningModule
 from lion_pytorch import Lion
 from torch import nn
 from torch.optim import AdamW
-from torchjd import mtl_backward
-from torchjd.aggregation import UPGrad
+# from torchjd import mtl_backward
+# from torchjd.aggregation import UPGrad
 
 
 class ModelWrapper(LightningModule):
@@ -75,6 +75,13 @@ class ModelWrapper(LightningModule):
         if hasattr(self, "log_custom_metrics"):
             self.log_custom_metrics(preds, targets, stage)
 
+    def detach_nested(self, d):
+        if isinstance(d, dict):
+            return {k: self.detach_nested(v) for k, v in d.items()}
+        if isinstance(d, torch.Tensor):
+            return d.detach().cpu()
+        return d
+
     def training_step(self, batch, batch_idx):
         inputs, targets = batch
 
@@ -85,6 +92,18 @@ class ModelWrapper(LightningModule):
         losses = self.model.loss(outputs, targets)
         total_loss = self.log_losses(losses, "train")
 
+        # if total_loss is None or total_loss > 100:
+        #     losses_per_element = self.model.loss_per_element(outputs, targets)
+
+        #     from datetime import datetime
+        #     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        #     torch.save(self.detach_nested(losses_per_element), 
+        #         f"/srv01/agrp/nilotpal/projects/glow_atlas/hepattn/src/hepattn/experiments/atlas/logs/losses_per_element_{timestamp}.pt")
+
+        #     idxs = targets["getitem_idx"].cpu().numpy().tolist()
+        #     print("\n\nLarge loss detected, problematic indices:\n", idxs, "\n\n")
+        #     exit(1)
+
         # Get the predictions from the model
         if batch_idx % self.trainer.log_every_n_steps == 0:  # avoid calling predict if possible
             preds = self.predict(outputs)
@@ -94,6 +113,10 @@ class ModelWrapper(LightningModule):
         if self.mtl:
             self.mlt_opt(losses, outputs)
             return None
+
+        # if self.global_step > 50_000:
+        #     total_loss = torch.clamp(total_loss, max=5.5)
+        self.log("train/clamped_loss", total_loss, sync_dist=True)
 
         return total_loss
 
@@ -158,23 +181,23 @@ class ModelWrapper(LightningModule):
         print("Skipping learning rate scheduler.")
         return opt
 
-    def mlt_opt(self, losses, outputs):
-        opt = self.optimizers()
-        opt.zero_grad()
+    # def mlt_opt(self, losses, outputs):
+    #     opt = self.optimizers()
+    #     opt.zero_grad()
 
-        for layer_name, layer_losses in losses.items():
-            # Get a list of the features that are used by all of the tasks
-            layer_feature_names = set()
-            for task in self.model.tasks:
-                layer_feature_names.update(task.inputs)
+    #     for layer_name, layer_losses in losses.items():
+    #         # Get a list of the features that are used by all of the tasks
+    #         layer_feature_names = set()
+    #         for task in self.model.tasks:
+    #             layer_feature_names.update(task.inputs)
 
-            # Remove any duplicate features that are used by multiple tasks
-            layer_features = [outputs[layer_name][feature_name] for feature_name in layer_feature_names]
+    #         # Remove any duplicate features that are used by multiple tasks
+    #         layer_features = [outputs[layer_name][feature_name] for feature_name in layer_feature_names]
 
-            # Perform the backward pass for this layer
-            # For each layer we sum the losses from each task, so we get one loss per task
-            layer_losses = [sum(losses[layer_name][task.name].values()) for task in self.model.tasks]
+    #         # Perform the backward pass for this layer
+    #         # For each layer we sum the losses from each task, so we get one loss per task
+    #         layer_losses = [sum(losses[layer_name][task.name].values()) for task in self.model.tasks]
 
-            mtl_backward(losses=layer_losses, features=layer_features, aggregator=UPGrad())
+    #         mtl_backward(losses=layer_losses, features=layer_features, aggregator=UPGrad())
 
-        opt.step()
+    #     opt.step()
