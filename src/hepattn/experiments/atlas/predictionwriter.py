@@ -78,9 +78,11 @@ def load_convert_h5(filepath):
         pflow_ptetaphi[neutral_mask][..., 0] = pflow_data[neutral_mask][..., 0] / np.cosh(pflow_ptetaphi[neutral_mask][..., 1])
 
         event_number = f["events"]["event_number"][:]
+        mc_channel_number = f["events"]["mc_channel_number"][:] if "mc_channel_number" in f["events"].dtype.names else None
 
         return (
             event_number,
+            mc_channel_number,
             pflow_class,
             pflow_ptetaphi,
             proxy_ptetaphi,
@@ -165,7 +167,11 @@ class PflowPredictionWriter(Callback):
             "event_number": u2s(
                 targets["event_number"].cpu().numpy().astype(np.int64).reshape(-1, 1),
                 dtype=np.dtype([("event_number", "i8")]),
-            )
+            ),
+            "mc_channel_number": u2s(
+                targets["mc_channel_number"].cpu().numpy().astype(np.int64).reshape(-1, 1),
+                dtype=np.dtype([("mc_channel_number", "i8")]),
+            ),
         }
         # object class
         to_write["object_class"] = {}
@@ -270,7 +276,7 @@ class PflowPredictionWriter(Callback):
             print(f"Wrote predictions to {self.output_path}")
             self.writer.close()
         print("Loading predictions...")
-        event_number, pflow_class, pflow_ptetaphi, proxy_ptetaphi, \
+        event_number, mc_channel_number, pflow_class, pflow_ptetaphi, proxy_ptetaphi, \
         proxy_ch_ptetaphi, proxy_neut_ptetaphi, is_charged, pflow_indicator = \
             load_convert_h5(self.output_path.as_posix())
         root_path = self.output_path.with_suffix(".root").as_posix()
@@ -301,5 +307,10 @@ class PflowPredictionWriter(Callback):
                 },
                 "pred_ind": ak.Array(pflow_indicator),
                 "event_number": ak.Array(event_number)[: len(pflow_indicator)],
+                **(
+                    {"mc_channel_number": ak.Array(mc_channel_number)[: len(pflow_indicator)]}
+                    if mc_channel_number is not None
+                    else {}
+                ),
             }
         print(f"Wrote ROOT file to {root_path}")

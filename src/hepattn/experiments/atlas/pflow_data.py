@@ -93,7 +93,19 @@ class ATLASDataset(Dataset):
         varlist = self.track_variables + self.topo_variables + self.particle_variables
 
         time1 = time.time()
-        arrays = tree.arrays(varlist + self.aux_vars, library="np", entry_stop=self.num_events)
+        # Read in chunks to avoid uproot's int32 overflow on total jagged content size
+        # (see uproot/interpretation/jagged.py: `before += off[-1] - off[0]` overflows for very large files).
+        chunk_size = 1000
+        all_branches = varlist + self.aux_vars
+        chunks = {var: [] for var in all_branches}
+        n_chunks = (self.num_events + chunk_size - 1) // chunk_size
+        for start in tqdm(range(0, self.num_events, chunk_size), total=n_chunks, desc="Reading ROOT chunks", unit="chunk"):
+            stop = min(start + chunk_size, self.num_events)
+            chunk = tree.arrays(all_branches, library="np", entry_start=start, entry_stop=stop)
+            for var in all_branches:
+                chunks[var].append(chunk[var])
+        arrays = {var: np.concatenate(chunks[var]) for var in all_branches}
+        del chunks
         load_time = time.time() - time1
         print(f"    Loaded {self.num_events} events and {len(varlist)+len(self.aux_vars)} variables in {load_time:.2f} seconds")
 
@@ -123,6 +135,7 @@ class ATLASDataset(Dataset):
         # self.event_number = tree["eventNumber"].array(library="np", entry_stop=self.num_events)
         # self.event_number = np.arange(len(self.n_tracks))
         self.event_number = arrays["eventNumber"]
+        self.mc_channel_number = arrays["mcChannelNumber"]
 
         mask = ((self.n_tracks + self.n_topos) < self.max_nodes) & (self.n_particles < self.num_objects)
         print(f"Removing {(~mask).sum()} events with too many nodes or particles")
@@ -139,12 +152,13 @@ class ATLASDataset(Dataset):
         self.n_topos = self.n_topos[mask]
         self.n_particles = self.n_particles[mask]
         self.event_number = self.event_number[mask]
+        self.mc_channel_number = self.mc_channel_number[mask]
 
         for var in self.topo_variables + self.particle_variables + self.track_variables:
             # flatten the arrays
             self.full_data_array[var] = np.concatenate(self.full_data_array[var][mask])
             if var == "particle_pdgid":
-                self.particle_class = torch.tensor([self.class_labels[x] for x in self.full_data_array[var]])
+                self.particle_class = torch.tensor([self.class_labels.get(x, 0) for x in self.full_data_array[var]])
             if var in {"track_phi", "track_phi_int", "topo_phi", "particle_phi"}:
                 self.full_data_array[var] = normalize_phi(self.full_data_array[var])
 
@@ -475,6 +489,7 @@ class ATLASDataset(Dataset):
             "particle_node_valid": torch.rand(self.num_objects, self.max_nodes) > 0.8,
             "particle_incidence": torch.rand(self.num_objects, self.max_nodes),
             "event_number": torch.tensor(idx, dtype=torch.int64),
+            "mc_channel_number": torch.tensor(0, dtype=torch.int64),
         }
 
         # Set valid particles
@@ -534,6 +549,7 @@ class ATLASDataset(Dataset):
             labels[f"particle_{label}"] = tgt
 
         labels["event_number"] = torch.tensor(self.event_number[idx], dtype=torch.int64)
+        labels["mc_channel_number"] = torch.tensor(self.mc_channel_number[idx], dtype=torch.int64)
         labels["getitem_idx"] = torch.tensor(idx, dtype=torch.int64)
 
         return inputs, labels
@@ -541,125 +557,82 @@ class ATLASDataset(Dataset):
     def init_label_dicts(self):
         # charged hadron: 0, electron: 1, muon: 2, neutral hadron: 3, photon: 4, residual: 5, neutrino: -1
         self.class_labels = {
-            -211: 0,
-            211: 0,  # pi+-
-            -213: 0,
-            213: 0,  # rho+-
-            -221: 0,
-            221: 0,  # eta+-
-            -223: 0,
-            223: 0,  # omega(782)
-            -321: 0,
-            321: 0,  # kaon+-
-            -323: 0,
-            323: 0,  # K*+-
-            -331: 3,
-            331: 3,  # eta'(958)
-            -333: 3,
-            333: 3,  # phi(1020)
-            311: 3,  # K0
-            -311: 3,
-            -411: 0,
-            411: 0,  # D+-
-            -413: 0,
-            413: 0,  # D*(2010)+-
-            -423: 3,
-            423: 3,  # D*(2007)0
-            -431: 0,
-            431: 0,  # D_s+-
-            -433: 0,
-            433: 0,  # D_s*+-
-            -511: 3,
-            511: 3,  # B0
-            -521: 0,
-            521: 0,  # B+-
-            -523: 0,
-            523: 0,  # B*+-
-            -531: 3,
-            531: 3,  # Bs0
-            -541: 0,
-            541: 0,  # B_c+-
-            -1114: 0,
-            1114: 0,  # delta+-
-            -2114: 0,
-            2114: 0,  # delta0
-            -2212: 0,
-            2212: 0,  # proton
-            -3112: 0,
-            3112: 0,  # sigma-
-            -3312: 0,
-            3312: 0,  # xi+-
-            -3222: 0,
-            3222: 0,  # sigma+
-            -3334: 0,
-            3334: 0,  # omega
-            -4122: 0,
-            4122: 0,  # lambda_c+
-            -4132: 3,
-            4132: 3,  # xi_c0
-            -4232: 0,
-            4232: 0,  # xi_c+-
-            -4312: 0,
-            4312: 0,  # xi'_c0
-            -4322: 0,
-            4322: 0,  # xi'_c+-
-            -4324: 0,
-            4324: 0,  # xi*c+-
-            -4332: 3,
-            4332: 3,  # omega_c0
-            -4334: 3,
-            4334: 3,  # omega*_c0
-            -5112: 0,
-            5112: 0,  # lambdab-
-            -5122: 3,
-            5122: 3,  # lambdab0
-            -5132: 0,
-            5132: 0,  # xib-
-            -5232: 3,
-            5232: 3,  # xi0_b
-            -5332: 0,
-            5332: 0,  # omega_b-
-            -11: 1,
-            11: 1,  # e
-            -13: 2,
-            13: 2,  # mu
-            -15: 0,
-            15: 0,  # tau (calling it charged hadron)
-            -111: 3,
-            111: 3,  # pi0
-            113: 3,  # rho0
-            130: 3,  # K0L
-            310: 3,  # K0S
-            -313: 3,
-            313: 3,  # K*0
-            -421: 3,
-            421: 3,  # D0
-            -2112: 3,
-            2112: 3,  # neutrons
-            -3122: 3,
-            3122: 3,  # lambda
-            -3322: 3,
-            3322: 3,  # xi0
-            22: 4,  # photon
-            1000010020: 0,  # deuteron
-            1000010030: 0,  # triton
-            1000010040: 0,  # alpha
-            1000020030: 0,  # He3
-            1000020040: 0,  # He4
-            1000030040: 0,  # Li6
-            1000030050: 0,  # Li7
-            1000020060: 0,  # C6
-            1000020070: 0,  # C7
-            1000020080: 0,  # O8
-            1000010048: 0,  # ?
-            1000020032: 0,  # ?
-            -999: 5,  # residual
-            -12: -1,
-            12: -1,  # nu_e
-            -14: -1,
-            14: -1,  # nu_mu
-            -16: -1,
-            16: -1,  # nu_tau
+            -211:   0,  211:  0,  # pi+-
+            -213:   0,  213:  0,  # rho+-
+            -221:   0,  221:  0,  # eta+-
+            -223:   0,  223:  0,  # omega(782)
+            -321:   0,  321:  0,  # kaon+-
+            -323:   0,  323:  0,  # K*+-
+            -331:   3,  331:  3,  # eta'(958)
+            -333:   3,  333:  3,  # phi(1020)
+            -411:   0,  411:  0,  # D+-
+            -413:   0,  413:  0,  # D*(2010)+-
+            -423:   3,  423:  3,  # D*(2007)0
+            -431:   0,  431:  0,  # D_s+-
+            -433:   0,  433:  0,  # D_s*+-
+            -511:   3,  511:  3,  # B0
+            -521:   0,  521:  0,  # B+-
+            -523:   0,  523:  0,  # B*+-
+            -531:   3,  531:  3,  # Bs0
+            -541:   0,  541:  0,  # B_c+-
+            -1114:  0, 1114:  0,  # delta+-
+            -2114:  0, 2114:  0,  # delta0
+            -2212:  0, 2212:  0,  # proton
+            -2214:  0, 2214:  0,  # delta+
+            -2224:  0, 2224:  0,  # delta++
+            -3112:  0, 3112:  0,  # sigma-
+            -3222:  0, 3222:  0,  # sigma+
+            -3224:  0, 3224:  0,  # sigma*+ 
+            -4222:  0, 4222:  0,  # sigma_c++
+            -3312:  0, 3312:  0,  # xi+-
+            -4132:  3, 4132:  3,  # xi_c0
+            -4232:  0, 4232:  0,  # xi_c+-
+            -4312:  0, 4312:  0,  # xi'_c0
+            -4322:  0, 4322:  0,  # xi'_c+-
+            -4324:  0, 4324:  0,  # xi*c+-
+            -3334:  0, 3334:  0,  # omega
+            -4332:  3, 4332:  3,  # omega_c0
+            -4334:  3, 4334:  3,  # omega*_c0
+            -4122:  0, 4122:  0,  # lambda_c+
+            -5112:  0, 5112:  0,  # lambdab-
+            -5122:  3, 5122:  3,  # lambdab0
+            -5132:  0, 5132:  0,  # xib-
+            -5232:  3, 5232:  3,  # xi0_b
+            -5332:  0, 5332:  0,  # omega_b-
+            -11:    1,   11:  1,  # e
+            -13:    2,   13:  2,  # mu
+            -15:    0,   15:  0,  # tau (calling it charged hadron)
+            -111:   3,  111:  3,  # pi0
+                        113:  3,  # rho0
+                        130:  3,  # K0L
+                        310:  3,  # K0S
+            -311:   3,  311:  3,  # K0
+            -313:   3,  313:  3,  # K*0
+            -421:   3,  421:  3,  # D0
+            -2112:  3, 2112:  3,  # neutrons
+            -3122:  3, 3122:  3,  # lambda
+            -3322:  3, 3322:  3,  # xi0
+            22:     4,            # photon
+            1000100200:  0,       # no clue what this is
+            1000120260:  0,       # no clue what this is
+            1000010020:  0,       # deuteron
+            1000010030:  0,       # triton
+            1000010040:  0,       # alpha
+            1000040080:  0,       # no clue what this is
+            1000020030:  0,       # He3
+            1000020040:  0,       # He4
+            1000030040:  0,       # Li6
+            1000030050:  0,       # Li7
+            1000020060:  0,       # C6
+            1000020070:  0,       # C7
+            1000020080:  0,       # O8
+            1000010048:  0,       # no clue what this is
+            1000020032:  0,       # no clue what this is
+            1000030070:  0,       # no clue what this is
+            -999:   5,            # residual
+            -12:   -1,   12: -1,  # nu_e
+            -14:   -1,   14: -1,  # nu_mu
+            -16:   -1,   16: -1,  # nu_tau
         }
 
     def init_variables_list(self):
@@ -699,6 +672,7 @@ class ATLASDataset(Dataset):
             "topo2particle_particle_idx",
             "topo2particle_energy",
             "eventNumber",
+            "mcChannelNumber",
         ]
 
 

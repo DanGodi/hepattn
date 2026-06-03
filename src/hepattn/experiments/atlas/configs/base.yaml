@@ -1,4 +1,4 @@
-name: atlas_v1_nopart
+name: atlas_run4_jz1234_v1
 seed_everything: 42
 
 data:
@@ -20,16 +20,12 @@ data:
       - sinphi
       - cosphi
 
-  num_objects: &num_particles 600 # 450 # 128
+  num_objects: &num_particles 600
+  max_nodes: 800
 
-  # train_path: /storage/agrp/dreyet/FullEventReco/HGPflow_ATLAS/data/dijet_JZ1_to_JZ8_Jan2026/train_1M/train_jz123_bw0.4.root
-  # valid_path: /storage/agrp/dreyet/FullEventReco/HGPflow_ATLAS/data/dijet_JZ1_to_JZ8_Jan2026/val_12k/val_jz123_bw0.4.root
-  # test_path: /storage/agrp/dreyet/FullEventReco/HGPflow_ATLAS/data/dijet_JZ1_to_JZ8_Jan2026/test_60k/jz1_user.edreyer.42822922._000003.mltree_seg_bw0.4.root
-
-  train_path: /storage/agrp/dreyet/FullEventReco/HGPflow_ATLAS/data/dijet_JZ1_to_JZ8_Jan2026/train_1M/train_jzAll_bw-1.root
-  valid_path: /storage/agrp/dreyet/FullEventReco/HGPflow_ATLAS/data/dijet_JZ1_to_JZ8_Jan2026/val_12k/val_jzAll_bw-1.root
-  test_path: /storage/agrp/dreyet/FullEventReco/HGPflow_ATLAS/data/dijet_JZ1_to_JZ8_Jan2026/test_60k/test_jz123_bw-1.root
-
+  train_path: /storage/agrp/dreyet/FullEventReco/HGPflow_ATLAS/data/dijet_JZ1234_May2026/train/train_JZ1234_run4_bw-1.root
+  valid_path: /storage/agrp/dreyet/FullEventReco/HGPflow_ATLAS/data/dijet_JZ1234_May2026/val/val_JZ1234_run4_bw-1.root
+  test_path: /storage/agrp/dreyet/FullEventReco/HGPflow_ATLAS/data/dijet_JZ1234_May2026/test/test_JZ1234_run4_bw-1.root
 
   num_workers: 4
   num_train: -1
@@ -48,7 +44,7 @@ trainer:
   precision: bf16-mixed
   gradient_clip_val: 0.1
   log_every_n_steps: 50
-  default_root_dir: /storage/agrp/nilotpal/GLOW_ATLAS/experiments
+  default_root_dir: /storage/agrp/dreyet/GLOW/hepattn_nilotpal/experiments
   enable_progress_bar: True
 
   logger:
