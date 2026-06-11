@@ -17,4 +17,8 @@ LOGFILE="logs/run_${JOBID_SHORT}.log"
 echo "Live log: $(pwd)/${LOGFILE}"
 
 CONFIG="${CONFIG:-configs/base.yaml}"
-python -u main.py fit -c "${CONFIG}" 2>&1 | tee "${LOGFILE}"
+TRAIN_ARGS=""
+if [ -n "${CKPT_PATH}" ]; then
+    TRAIN_ARGS="--ckpt_path ${CKPT_PATH}"
+fi
+python -u main.py fit -c "${CONFIG}" ${TRAIN_ARGS} 2>&1 | tee "${LOGFILE}"

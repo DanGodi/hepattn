@@ -32,7 +32,7 @@ data:
   num_test: -1
   num_val: -1
 
-  batch_size: 128
+  batch_size: 96
   incidence_cutval: 0.01
 
   scale_dict_path: &scale_dict_path configs/atlas_var_transform.yaml
