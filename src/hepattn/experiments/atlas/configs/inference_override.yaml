@@ -1,0 +1,4 @@
+# Stacked on top of any base/training config for inference (test) runs.
+# Only contains settings that must differ from training.
+data:
+  is_inference: true
