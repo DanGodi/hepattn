@@ -1,10 +1,14 @@
 import gc
+import json
+import os
+import shutil
 from pathlib import Path
 import time
 
 import lightning as L
 import numpy as np
 import torch
+import torch.distributed as dist
 import uproot
 from lightning import seed_everything
 from torch.utils.data import DataLoader, Dataset
@@ -177,6 +181,9 @@ class ATLASDataset(Dataset):
         for var in self.aux_vars:
             print(f"Loading aux var {var}")
             self.aux_data_array[var] = arrays[var][mask]
+
+        del arrays
+        gc.collect()
 
         self.num_events = np.sum(mask)
         print(f"Number of events after filtering: {self.num_events}")
@@ -769,3 +776,272 @@ class PflowDataModule(L.LightningDataModule):
     def test_dataloader(self):
         print("Instantiating test dataloader on rank", self.trainer.local_rank)
         return self.get_dataloader(dataset=self.test_dset, stage="test", shuffle=False)
+
+
+PHI_NORM_VARIABLES = {"track_phi", "track_phi_int", "topo_phi", "particle_phi"}
+
+# Branch baskets hold ~2025 entries, so reading fewer entries than that per call refetches and
+# redecompresses each basket, and issues many small high latency reads. Reading 20k events per call
+# is ~10x faster for the same bytes, and stays well under uproot's int32 jagged content limit.
+BUILD_CHUNK_SIZE = 20000
+
+
+def open_flat(path, dtype, length):
+    if length == 0:
+        return np.zeros(0, dtype=dtype)
+    return np.memmap(path, dtype=dtype, mode="r", shape=(length,))
+
+
+class MemmapFlat:
+    """Flat on-disk array indexed by cumsum offsets; slicing copies into a torch tensor."""
+
+    def __init__(self, path, dtype, length):
+        self.array = open_flat(path, dtype, length)
+
+    def __getitem__(self, key):
+        return torch.from_numpy(np.array(self.array[key]))
+
+    def __len__(self):
+        return len(self.array)
+
+
+class MemmapJagged:
+    """Per-event variable length on-disk array; indexing copies into a numpy array."""
+
+    def __init__(self, path, dtype, offsets):
+        self.array = open_flat(path, dtype, int(offsets[-1]))
+        self.offsets = offsets
+
+    def __getitem__(self, idx):
+        return np.array(self.array[self.offsets[idx] : self.offsets[idx + 1]])
+
+    def __len__(self):
+        return len(self.offsets) - 1
+
+
+def build_memmap_cache(cache_dir, filepath, varlist, aux_vars, class_labels, num_events, max_nodes, num_objects, remove_wrong_idxs):
+    """Stream the ROOT file chunk by chunk into flat binary files, keeping only one chunk in memory."""
+    build_dir = cache_dir.with_name(cache_dir.name + ".building")
+    if build_dir.exists():
+        shutil.rmtree(build_dir)
+    build_dir.mkdir(parents=True)
+
+    handles, dtypes, lengths, jagged_lens = {}, {}, {}, {}
+    per_event = {"n_tracks": [], "n_topos": [], "n_particles": [], "event_number": [], "mc_channel_number": []}
+
+    def write(name, array):
+        if name not in handles:
+            handles[name] = (build_dir / f"{name}.bin").open("wb")
+            dtypes[name] = array.dtype.str
+            lengths[name] = 0
+        handles[name].write(array.tobytes())
+        lengths[name] += array.size
+
+    chunk_size = BUILD_CHUNK_SIZE
+    with uproot.open(filepath, num_workers=6) as f:
+        tree = f["EventTree"]
+        total = tree.num_entries
+        if num_events > 0:
+            total = min(total, num_events)
+
+        n_chunks = (total + chunk_size - 1) // chunk_size
+        for start in tqdm(range(0, total, chunk_size), total=n_chunks, desc="Building memmap cache", unit="chunk"):
+            chunk = tree.arrays(varlist + aux_vars, library="np", entry_start=start, entry_stop=min(start + chunk_size, total))
+
+            n_tracks = np.array([len(x) for x in chunk["track_d0"]])
+            n_topos = np.array([len(x) for x in chunk["topo_e"]])
+            n_particles = np.array([len(x) for x in chunk["particle_pdgid"]])
+
+            mask = ((n_tracks + n_topos) < max_nodes) & (n_particles < num_objects)
+            if remove_wrong_idxs:
+                mask &= np.array([len(x) for x in chunk["track_particle_idx"]]) == n_tracks
+            if not mask.any():
+                continue
+
+            per_event["n_tracks"].append(n_tracks[mask])
+            per_event["n_topos"].append(n_topos[mask])
+            per_event["n_particles"].append(n_particles[mask])
+            per_event["event_number"].append(chunk["eventNumber"][mask])
+            per_event["mc_channel_number"].append(chunk["mcChannelNumber"][mask])
+
+            for var in varlist:
+                flat = np.concatenate(chunk[var][mask])
+                if "phi" in var and "particle" not in var:
+                    write(var.replace("phi", "sinphi"), np.sin(flat.astype(np.float32)))
+                    write(var.replace("phi", "cosphi"), np.cos(flat.astype(np.float32)))
+                if var == "particle_pdgid":
+                    write("particle_class", np.array([class_labels.get(int(x), 0) for x in flat], dtype=np.int64))
+                if var in PHI_NORM_VARIABLES:
+                    flat = normalize_phi(flat)
+                write(var, flat)
+
+            for var in aux_vars:
+                column = chunk[var][mask]
+                if column.dtype != object:
+                    continue
+                jagged_lens.setdefault(var, []).append(np.array([len(x) for x in column]))
+                write(var, np.concatenate(column))
+
+    for handle in handles.values():
+        handle.close()
+
+    for name, arrays in per_event.items():
+        np.save(build_dir / f"{name}.npy", np.concatenate(arrays))
+
+    for name, lens in jagged_lens.items():
+        offsets = np.concatenate([[0], np.cumsum(np.concatenate(lens))]).astype(np.int64)
+        np.save(build_dir / f"{name}_offsets.npy", offsets)
+
+    (build_dir / "meta.json").write_text(json.dumps({"dtypes": dtypes, "lengths": lengths, "jagged": sorted(jagged_lens)}))
+    build_dir.rename(cache_dir)
+
+
+class MemmapATLASDataset(ATLASDataset):
+    """Backs the dataset with on-disk memmaps in $TMPDIR so events are paged in lazily.
+
+    The cache is built once per node by rank 0 and shared by every rank through the OS page cache,
+    which bounds both the peak memory while loading and the resident memory while training.
+    """
+
+    def __init__(
+        self,
+        filepath: str,
+        inputs: dict,
+        targets: dict,
+        scale_dict_path: str,
+        num_events: int = -1,
+        num_objects: int = 150,
+        max_nodes: int = 160,
+        remove_wrong_idxs: bool = True,
+        incidence_cutval: float = 1e-4,
+        is_inference: bool = False,
+        dummy_data: bool = False,
+    ):
+        if dummy_data:
+            super().__init__(
+                filepath=filepath,
+                inputs=inputs,
+                targets=targets,
+                scale_dict_path=scale_dict_path,
+                num_events=num_events,
+                num_objects=num_objects,
+                max_nodes=max_nodes,
+                remove_wrong_idxs=remove_wrong_idxs,
+                incidence_cutval=incidence_cutval,
+                is_inference=is_inference,
+                dummy_data=dummy_data,
+            )
+            return
+
+        self.sampling_seed = 42
+        np.random.default_rng(self.sampling_seed)
+        seed_everything(self.sampling_seed, workers=True)
+
+        self.scaler = FeatureScaler(scale_dict_path)
+        self.init_label_dicts()
+        self.init_variables_list()
+
+        self.filepath = filepath
+        self.dummy_data = dummy_data
+        self.inputs = inputs
+        self.targets = targets
+        self.num_objects = num_objects
+        self.max_nodes = max_nodes
+        self.remove_wrong_idxs = remove_wrong_idxs
+        self.incidence_cutval = incidence_cutval
+        self.is_inference = is_inference
+
+        assert is_valid_file(filepath), f"Invalid file: {filepath}"
+
+        cache_key = f"{Path(filepath).stem}_{num_events}_{max_nodes}_{num_objects}_{int(remove_wrong_idxs)}"
+        cache_dir = Path(os.environ.get("TMPDIR", "/tmp")) / "atlas_memmap" / cache_key
+
+        distributed = dist.is_available() and dist.is_initialized()
+        if not distributed or dist.get_rank() == 0:
+            if cache_dir.exists():
+                print(f"Reusing memmap cache at {cache_dir}")
+            else:
+                print(f"Building memmap cache for {filepath} at {cache_dir}")
+                build_memmap_cache(
+                    cache_dir,
+                    filepath,
+                    self.track_variables + self.topo_variables + self.particle_variables,
+                    self.aux_vars,
+                    self.class_labels,
+                    num_events,
+                    max_nodes,
+                    num_objects,
+                    remove_wrong_idxs,
+                )
+        if distributed:
+            dist.barrier()
+
+        self.open_memmap_cache(cache_dir)
+
+    def open_memmap_cache(self, cache_dir):
+        meta = json.loads((cache_dir / "meta.json").read_text())
+        dtypes, lengths, jagged = meta["dtypes"], meta["lengths"], set(meta["jagged"])
+
+        self.n_tracks = np.load(cache_dir / "n_tracks.npy")
+        self.n_topos = np.load(cache_dir / "n_topos.npy")
+        self.n_particles = np.load(cache_dir / "n_particles.npy")
+        self.event_number = np.load(cache_dir / "event_number.npy")
+        self.mc_channel_number = np.load(cache_dir / "mc_channel_number.npy")
+
+        self.num_events = len(self.n_tracks)
+        self.n_nodes = self.n_tracks + self.n_topos
+        self.track_cumsum = np.concatenate([[0], np.cumsum(self.n_tracks)])
+        self.topo_cumsum = np.concatenate([[0], np.cumsum(self.n_topos)])
+        self.particle_cumsum = np.concatenate([[0], np.cumsum(self.n_particles)])
+
+        self.full_data_array = {
+            name: MemmapFlat(cache_dir / f"{name}.bin", dtypes[name], lengths[name])
+            for name in dtypes
+            if name not in jagged and name != "particle_class"
+        }
+        self.particle_class = MemmapFlat(cache_dir / "particle_class.bin", dtypes["particle_class"], lengths["particle_class"])
+        self.aux_data_array = {
+            name: MemmapJagged(cache_dir / f"{name}.bin", dtypes[name], np.load(cache_dir / f"{name}_offsets.npy"))
+            for name in jagged
+        }
+
+        self.track_variables = [name for name in self.full_data_array if "track" in name]
+        self.topo_variables = [name for name in self.full_data_array if "topo" in name]
+        self.neg_contribs = []
+        self.fake_TC_count = []
+
+        print(f"Loaded {self.num_events} events from memmap cache {cache_dir}")
+
+
+class MemmapPflowDataModule(PflowDataModule):
+    def setup(self, stage: str):
+        if stage == "fit":
+            self.train_dset = MemmapATLASDataset(
+                filepath=self.train_path,
+                num_events=self.num_train,
+                scale_dict_path=self.scale_dict_path,
+                **self.kwargs,
+            )
+            self.val_dset = MemmapATLASDataset(
+                filepath=self.valid_path,
+                num_events=self.num_val,
+                scale_dict_path=self.scale_dict_path,
+                **self.kwargs,
+            )
+
+        if stage == "fit" and self.trainer.is_global_zero:
+            print(f"Created training dataset with {len(self.train_dset):,} events")
+            print(f"Created validation dataset with {len(self.val_dset):,} events")
+
+        if stage == "test":
+            assert self.test_path is not None, "No test file specified, see --data.test_path"
+            self.test_dset = MemmapATLASDataset(
+                filepath=self.test_path,
+                num_events=self.num_test,
+                scale_dict_path=self.scale_dict_path,
+                **self.kwargs,
+            )
+            print(f"Created test dataset with {len(self.test_dset):,} events")
+
+        if self.trainer.is_global_zero:
+            print("-" * 100, "\n")

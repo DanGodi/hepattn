@@ -1,5 +1,11 @@
 """Top level training script, powered by the lightning CLI."""
 
+import os
+import sys
+
+if not sys.flags.no_site:
+    os.execv(sys.executable, [sys.executable, "-S", *sys.argv])
+
 import pathlib
 
 from lightning.pytorch.cli import ArgsType
@@ -15,6 +21,7 @@ def main(args: ArgsType = None) -> None:
     CLI(
         model_class=MPflow,
         datamodule_class=PflowDataModule,
+        subclass_mode_data=True,
         args=args,
         parser_kwargs={"default_env": True, "fit": {"default_config_files": [f"{config_dir}/base.yaml"]}},
     )
